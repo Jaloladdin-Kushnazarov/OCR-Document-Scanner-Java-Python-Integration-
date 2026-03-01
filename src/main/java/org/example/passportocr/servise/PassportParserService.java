@@ -5,289 +5,420 @@ import org.example.passportocr.dto.BaseDocumentDto;
 import org.example.passportocr.dto.PassportDto;
 import org.example.passportocr.enums.DocumentType;
 import org.springframework.stereotype.Service;
+
 import java.time.LocalDate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-@RequiredArgsConstructor
+/**
+ * O'zbekiston xalqaro pasporti parseri.
+ *
+ * OCR xatolari hisobga olingan:
+ * - "2 5 . 12 . 1998" → boʻshliqli sanalar
+ * - "SURANAME" → "SURNAME" yoki "FAMILIYASI" nomi
+ * - "M" jinsi — label bilan birga keladi
+ * - Authority: "MIA 3 3 223" → raqamlar qo'shiladi
+ * - MRZ satri: P<UZBQUSHNAZAROV<<JALOLADDIN... dan kuchli fallback
+ */
 @Service
+@RequiredArgsConstructor
 public class PassportParserService {
 
-    public BaseDocumentDto parse(String text) {
-        PassportDto dto = new PassportDto();
-        String cleaned = normalize(text);
-        System.out.println( text);
-        System.out.println(cleaned);
+    // MRZ 1-satri: P<UZB FAMILIYA << ISM
+    private static final Pattern MRZ_LINE1 = Pattern.compile(
+            "P<UZB([A-Z]+)<<([A-Z]+)");
 
+    // MRZ 2-satri: FA40892165UZB9812253M31101193...
+    // Groups: 1=ppNo, 2=YY, 3=MM, 4=DD(birth), 5=gender, 6=YY, 7=MM, 8=DD(expiry)
+    private static final Pattern MRZ_LINE2 = Pattern.compile(
+            "([A-Z]{2}\\d{7,8})UZB(\\d{2})(\\d{2})(\\d{2})([MF])(\\d{2})(\\d{2})(\\d{2})");
+
+    // Sana: "25.12.1998" yoki "25/12/1998"
+    private static final Pattern DATE_CLEAN = Pattern.compile(
+            "(\\d{2})[./\\-](\\d{2})[./\\-](\\d{4})");
+
+    // Passport raqami: FA 4089216 yoki FA4089216
+    private static final Pattern PASSPORT_NO = Pattern.compile(
+            "\\b([A-Z]{2})\\s?(\\d{7,8})\\b");
+
+    // Authority: MIA 33223
+    private static final Pattern AUTHORITY_PAT = Pattern.compile(
+            "\\b((?:MIA|GUM|MOI|GUMVD|MVD|GUVD)\\s*\\d{3,8})\\b");
+
+    public BaseDocumentDto parse(String rawText) {
+        PassportDto dto = new PassportDto();
         dto.setDocumentType(DocumentType.PASSPORT);
-        dto.setFamiliya(extractFamiliya(cleaned));
-        dto.setIsm(extractIsm(cleaned));
-        dto.setFuqaroligi(cleaned.contains("O'ZBEKISTON") ? "O'ZBEKISTON" : null);
-        dto.setJinsi(extractGender(cleaned));
-        dto.setTugilganSana(extractBirthDate(cleaned));
-        dto.setTugilganJoy(extractPlaceOfBirth(cleaned));
-        dto.setPassportRaqami(extractPassportNumber(cleaned));
-        dto.setBerilganSana(extractBerilganSana(cleaned));
-        dto.setAmalQilishMuddati(extractDateAfterKeyword(cleaned, "DATE OF EXPIRY"));
-        dto.setText(text);
+        dto.setText(rawText);
+
+        String t = normalize(rawText);
+
+        dto.setFamiliya(extractFamiliya(t));
+        dto.setIsm(extractIsm(t));
+        dto.setFuqaroligi(extractCitizenship(t));
+        dto.setJinsi(extractGender(t));
+        dto.setTugilganSana(extractBirthDate(t));
+        dto.setTugilganJoy(extractPlaceOfBirth(t));
+        dto.setPassportRaqami(extractPassportNumber(t));
+        dto.setAuthority(extractAuthority(t));
+        dto.setBerilganSana(extractIssuedDate(t));
+        dto.setAmalQilishMuddati(extractExpiryDate(t));
+
         return dto;
     }
 
+    // ---------------------------------------------------------------
+    // Normalize
+    // ---------------------------------------------------------------
     private String normalize(String text) {
-        if (text == null || text.isBlank()) return "";
+        if (text == null || text.isBlank())
+            return "";
 
-        // 1. Standart normalize qilishlar
-        String normalized = text.toUpperCase()
-                .replaceAll("[‘’´`]", "'")
-                .replaceAll("0'", "O'")
-                .replaceAll("[_]+", ".")
-                .replaceAll("\\.{2,}", ".")
-                .replaceAll("(?<=\\d)\\.\\s+(?=\\d)", ".")
-                .replaceAll("(?<!\\d)[/\\\\](?!\\d)", " - ")
-                .replaceAll("(?<=\\d)[ _](?=\\d)", ".")
-                .replaceAll("(?<=DATE OF)\\s+(BIRTH|ISSUE|EXPIRY)", " $1")
-                .replaceAll("RAQAMI[-\\s\\/\\\\]*", "RAQAMI ")
-                .replaceAll("\\s+", " ") // bo‘sh joylarni tekislash
+        String n = text.toUpperCase()
+                .replaceAll("[''´`ʼ]", "'")
+                .replaceAll("О'", "O'")
+                .replaceAll("\\b0'(?=[A-Z])", "O'")
+                // MRZ qatorini saqlash kerak — unga tegmaymiz
+                // Boʻshliqli sanalarni normallashtirish: "2 5 . 1 2 . 1 9 9 8"
+                // Har xil variantlar:
+                .replaceAll("(\\d)\\s+\\.\\s+(\\d)", "$1.$2") // "2 5 . 12" → "25.12"
+                .replaceAll("(\\d)\\s(\\d)(?=\\s*[./])", "$1$2") // "2 5." → "25."
+                .replaceAll("(\\d{2})\\s*[./]\\s*(\\d{2})\\s*[./]\\s*(\\d{4})", "$1.$2.$3")
+                // |, {, } ni olib tashlash
+                .replace("|", " ")
+                .replaceAll("[{}]", " ")
+                .replaceAll("\\s+", " ")
                 .trim();
 
-        // 2. AUTHORITY blokini yaxshilash (MIA 332 2 3 → MIA 33223)
-        Pattern authorityPattern = Pattern.compile("(AUTHORITY ISSUE\\s+(MIA|GUM|MOI|GUMVD|MVD|GUVD)\\s+)(\\d(?:\\s*\\d){2,6})");
-        Matcher matcher = authorityPattern.matcher(normalized);
+        // Authority inline fix (replaceAll lambda ishlamaydi — alohida qilamiz)
+        n = fixAuthority(n);
+
+        return n;
+    }
+
+    private String fixAuthority(String t) {
+        // "MIA 3 3 2 2 3" → "MIA 33223"
+        Matcher m = Pattern.compile("((?:MIA|GUM|MOI|GUMVD|MVD|GUVD))\\s+((?:\\s*\\d){3,10})").matcher(t);
         StringBuffer sb = new StringBuffer();
-        while (matcher.find()) {
-            String label = matcher.group(1); // AUTHORITY ISSUE MIA
-            String digits = matcher.group(3).replaceAll("\\s", ""); // raqamlarni birlashtirish
-            matcher.appendReplacement(sb, label + digits);
+        while (m.find()) {
+            String org = m.group(1);
+            String digits = m.group(2).replaceAll("\\s", "");
+            m.appendReplacement(sb, org + " " + digits);
         }
-        matcher.appendTail(sb);
-        normalized = sb.toString();
-
-        // 3. Sanalarni to‘g‘rilash
-        normalized = normalized
-                .replaceAll("(\\d{1,2})\\s*\\.\\s*(\\d{1,2})\\s*\\.\\s*(\\d{2,4})", "$1.$2.$3");
-
-        return normalized;
+        m.appendTail(sb);
+        return sb.toString().replaceAll("\\s+", " ").trim();
     }
 
-    private String extractFamiliya(String text) {
-        // 1. FAMILIYASI SURANAME dan olishga urinamiz
-        Pattern pattern = Pattern.compile("FAMILIYASI SURANAME\\s+([A-Z']+)");
-        Matcher matcher = pattern.matcher(text);
-        if (matcher.find()) {
-            return matcher.group(1);
+    // ---------------------------------------------------------------
+    // Familiya
+    // ---------------------------------------------------------------
+    private String extractFamiliya(String t) {
+        // FAMILIYASI / SURANAME yoki SURNAME (OCR "SURANAME" deb o'qiydi)
+        String[] patterns = {
+                "FAMILIYASI\\s*/\\s*SURANAME\\s+([A-Z][A-Z'\\-]{1,35})",
+                "FAMILIYASI\\s*/\\s*SURNAME\\s+([A-Z][A-Z'\\-]{1,35})",
+                "FAMILIYASI\\s+([A-Z][A-Z'\\-]{1,35})",
+                "SURANAME\\s+([A-Z][A-Z'\\-]{1,35})",
+                "SURNAME\\s+([A-Z][A-Z'\\-]{1,35})"
+        };
+        for (String pat : patterns) {
+            Matcher m = Pattern.compile(pat).matcher(t);
+            if (m.find())
+                return m.group(1).trim();
         }
-        // 2. Agar topilmasa — MRZ'dan olishga urinamiz
-        return extractFromMRZ(text, "familiya");
+        // MRZ fallback
+        Matcher mrzM = MRZ_LINE1.matcher(t);
+        if (mrzM.find())
+            return mrzM.group(1);
+        return null;
     }
-    private String extractIsm(String text) {
-        Pattern pattern = Pattern.compile("ISMI CIVEN NAME\\(S\\)\\s+([A-Z']+)");
-        Matcher matcher = pattern.matcher(text);
-        if (matcher.find()) {
-            return matcher.group(1);
+
+    // ---------------------------------------------------------------
+    // Ismi
+    // ---------------------------------------------------------------
+    private String extractIsm(String t) {
+        String[] patterns = {
+                "ISMI\\s*/\\s*GIVEN\\s+NAME\\S*\\s+([A-Z][A-Z'\\- ]{2,40}?)(?=\\s{2,}|\\s+[A-Z]{5,}\\s*/|$)",
+                "GIVEN\\s+NAME\\S*\\s+([A-Z][A-Z'\\- ]{2,40}?)(?=\\s{2,}|\\s+[A-Z]{5,}\\s*/|$)",
+                "ISMI\\s+([A-Z][A-Z]{3,20})(?=\\s+[A-Z]{4,}|$)"
+        };
+        for (String pat : patterns) {
+            Matcher m = Pattern.compile(pat).matcher(t);
+            if (m.find()) {
+                String cand = m.group(1).trim();
+                if (!cand.isEmpty())
+                    return cand;
+            }
+        }
+        // MRZ fallback
+        Matcher mrzM = MRZ_LINE1.matcher(t);
+        if (mrzM.find())
+            return mrzM.group(2);
+        return null;
+    }
+
+    // ---------------------------------------------------------------
+    // Citizenship
+    // ---------------------------------------------------------------
+    private String extractCitizenship(String t) {
+        String[] variants = { "O'ZBEKISTON", "OZBEKISTON", "UZBEKISTAN" };
+        int idx = t.indexOf("FUQAROLIGI");
+        if (idx == -1)
+            idx = t.indexOf("CITIZENSHIP");
+        if (idx != -1) {
+            String slice = t.substring(idx, Math.min(t.length(), idx + 60));
+            for (String v : variants)
+                if (slice.contains(v))
+                    return "O'ZBEKISTON";
+        }
+        for (String v : variants)
+            if (t.contains(v))
+                return "O'ZBEKISTON";
+        return null;
+    }
+
+    // ---------------------------------------------------------------
+    // Jinsi — passport: M/F, ID: ERKAK/AYOL
+    // ---------------------------------------------------------------
+    private String extractGender(String t) {
+        // Jinsi / SEX dan keyin "M" yoki "F"
+        int idx = t.indexOf("JINSI");
+        if (idx == -1)
+            idx = t.indexOf("/ SEX");
+        if (idx == -1)
+            idx = t.indexOf("SEX");
+        if (idx != -1) {
+            String slice = t.substring(idx, Math.min(t.length(), idx + 40));
+            // "M XONQA" kabi — M dan keyin joy ismi kelsa ham "M" ni gender sifatida olish
+            Matcher m = Pattern.compile("\\b([MF])\\b").matcher(slice);
+            if (m.find())
+                return m.group(1).equals("M") ? "Erkak" : "Ayol";
+        }
+        // MRZ fallback: ...9812253M31101193... → M
+        Matcher mrzM = MRZ_LINE2.matcher(t);
+        if (mrzM.find())
+            return mrzM.group(5).equals("M") ? "Erkak" : "Ayol";
+
+        if (t.contains("ERKAK"))
+            return "Erkak";
+        if (t.contains("AYOL"))
+            return "Ayol";
+        return null;
+    }
+
+    // ---------------------------------------------------------------
+    // Tug'ilgan sana
+    // ---------------------------------------------------------------
+    private String extractBirthDate(String t) {
+        // 1. Label asosida
+        String[] labels = {
+                "TUG'ILGAN SANASI / DATE OF BIRTH",
+                "TUG'ILGAN SANASI/DATE OF BIRTH",
+                "DATE OF BIRTH",
+                "TUG'ILGAN SANASI",
+                "TUGILGAN SANASI"
+        };
+        for (String lbl : labels) {
+            int idx = t.indexOf(lbl);
+            if (idx == -1)
+                continue;
+            String slice = t.substring(idx + lbl.length(), Math.min(t.length(), idx + lbl.length() + 60));
+            Matcher dm = DATE_CLEAN.matcher(slice);
+            if (dm.find())
+                return formatDate(dm);
         }
 
-        return extractFromMRZ(text, "ism");
-    }
-    private String extractFromMRZ(String text, String field) {
-        Pattern pattern = Pattern.compile("P<UZB([A-Z]+)<<([A-Z]+)");
-        Matcher matcher = pattern.matcher(text);
-        if (matcher.find()) {
-            if (field.equals("familiya")) return matcher.group(1);
-            if (field.equals("ism")) return matcher.group(2);
+        // 2. MRZ fallback — YYMMDD
+        Matcher mrzM = MRZ_LINE2.matcher(t);
+        if (mrzM.find()) {
+            String yy = mrzM.group(2);
+            String mm = mrzM.group(3);
+            String dd = mrzM.group(4);
+            return dd + "." + mm + "." + yyToYear(yy);
+        }
+
+        // 3. Barcha sanalardan tug'ilgan yilni topish
+        Matcher dm = DATE_CLEAN.matcher(t);
+        while (dm.find()) {
+            try {
+                int year = Integer.parseInt(dm.group(3));
+                if (year >= 1930 && year <= LocalDate.now().getYear() - 10)
+                    return formatDate(dm);
+            } catch (Exception ignored) {
+            }
         }
         return null;
     }
 
-    private String extractBirthDate(String text) {
-        // 1. OCR Label asosida — TUG'ILGAN SANASI yoki DATE OF BIRTH
-        Pattern labelPattern = Pattern.compile(
-                "(TUG['`]ILGAN SANASI|DATE OF BIRTH)[^\\d]{0,10}(\\d{1,2})[\\s_./-]?(\\d{1,2})[\\s_./-]?(\\d{2,4})"
-        );
-        Matcher matcher = labelPattern.matcher(text);
-        if (matcher.find()) {
-            String day = padZero(matcher.group(2));
-            String month = padZero(matcher.group(3));
-            String year = normalizeYear(matcher.group(4));
-            return String.format("%s.%s.%s", day, month, year);
-        }
-
-        // 2. Fallback — faqat sana qidirish
-        Pattern dateOnly = Pattern.compile("(\\d{2})[\\s_./-]?(\\d{2})[\\s_./-]?(\\d{4})");
-        Matcher fallback = dateOnly.matcher(text);
-        while (fallback.find()) {
-            String d = fallback.group(1), m = fallback.group(2), y = fallback.group(3);
-            int year = Integer.parseInt(y);
-            if (year > 1900 && year <= LocalDate.now().getYear()) {
-                return String.format("%s.%s.%s", d, m, y);
+    // ---------------------------------------------------------------
+    // Tug'ilgan joy
+    // ---------------------------------------------------------------
+    private String extractPlaceOfBirth(String t) {
+        String[] labels = {
+                "TUG'ILGAN JOYI / PLACE OF BIRTH",
+                "PLACE OF BIRTH",
+                "TUG'ILGAN JOYI",
+                "TUGILGAN JOYI"
+        };
+        for (String lbl : labels) {
+            int idx = t.indexOf(lbl);
+            if (idx == -1)
+                continue;
+            String slice = t.substring(idx + lbl.length(), Math.min(t.length(), idx + lbl.length() + 50)).trim();
+            // Keyingi bo'limga qadar
+            Matcher pm = Pattern.compile("([A-Z][A-Z'\\- ]{1,30}?)(?=\\s{2,}|\\s+BERIL|\\s+DATE|$)").matcher(slice);
+            if (pm.find()) {
+                String place = pm.group(1).trim();
+                // "XONQA BERILGAN SANASI" kabi keraksiz davomni kesib tashlash
+                if (place.contains("BERILGAN"))
+                    place = place.substring(0, place.indexOf("BERILGAN")).trim();
+                if (!place.isBlank())
+                    return place;
             }
         }
-
-        // 3. MRZ fallback
-        Pattern mrzPattern = Pattern.compile("([A-Z0-9<]+)(\\d{2})(\\d{2})(\\d{2})M"); // M erkak
-        Matcher mrz = mrzPattern.matcher(text);
-        if (mrz.find()) {
-            String yy = mrz.group(2);
-            String mm = mrz.group(3);
-            String dd = mrz.group(4);
-            String fullYear = yyToFullYear(yy);
-            return String.format("%s.%s.%s", dd, mm, fullYear);
+        // "Jinsi / SEX M XONQA BERILGAN..." dan — M/F dan keyin joy nomi
+        int sexIdx = t.indexOf("JINSI");
+        if (sexIdx != -1) {
+            String slice = t.substring(sexIdx, Math.min(t.length(), sexIdx + 60));
+            // "M XONQA" yoki "F TOSHKENT"
+            Matcher pm = Pattern.compile("\\b[MF]\\s+([A-Z][A-Z]{1,20})\\b").matcher(slice);
+            if (pm.find())
+                return pm.group(1);
         }
-
-        return null; // topilmadi
-    }
-    private String padZero(String input) {
-        return input.length() == 1 ? "0" + input : input;
+        return null;
     }
 
-    private String normalizeYear(String year) {
-        if (year.length() == 2) {
-            int y = Integer.parseInt(year);
-            return y > 30 ? "19" + year : "20" + year;
+    // ---------------------------------------------------------------
+    // Passport raqami
+    // ---------------------------------------------------------------
+    private String extractPassportNumber(String t) {
+        String[] labels = {
+                "PASSPORT RAQAMI/ PASSPORT NO.",
+                "PASSPORT RAQAMI/PASSPORT NO.",
+                "PASSPORT RAQAMI/ PASSPORT NO",
+                "PASSPORT NO.",
+                "PASSPORT RAQAMI",
+                "PASPORT RAQAMI"
+        };
+        for (String lbl : labels) {
+            int idx = t.indexOf(lbl);
+            if (idx != -1) {
+                String slice = t.substring(idx, Math.min(t.length(), idx + 25));
+                Matcher pm = PASSPORT_NO.matcher(slice);
+                if (pm.find())
+                    return pm.group(1) + pm.group(2);
+            }
         }
-        return year;
+        // MRZ fallback
+        Matcher mrzM = MRZ_LINE2.matcher(t);
+        if (mrzM.find())
+            return mrzM.group(1);
+        // Butun matn
+        Matcher pm = PASSPORT_NO.matcher(t);
+        if (pm.find())
+            return pm.group(1) + pm.group(2);
+        return null;
     }
 
-    private String yyToFullYear(String yy) {
+    // ---------------------------------------------------------------
+    // Authority / Kim tomonidan berilgan
+    // ---------------------------------------------------------------
+    private String extractAuthority(String t) {
+        String[] labels = {
+                "KIM TOMONIDAN BERILGAN / AUTHORITY",
+                "KIM TOMONIDAN BERILGAN/AUTHORITY",
+                "KIM TOMONIDAN BERILGAN",
+                "AUTHORITY"
+        };
+        for (String lbl : labels) {
+            int idx = t.indexOf(lbl);
+            if (idx != -1) {
+                String slice = t.substring(idx + lbl.length(), Math.min(t.length(), idx + lbl.length() + 30)).trim();
+                Matcher am = AUTHORITY_PAT.matcher(slice);
+                if (am.find())
+                    return am.group(1).trim();
+                // Fallback: keyingi 1-2 token
+                if (!slice.isBlank()) {
+                    String[] tokens = slice.split("\\s+");
+                    if (tokens.length >= 2)
+                        return tokens[0] + " " + tokens[1];
+                    if (tokens.length == 1)
+                        return tokens[0];
+                }
+            }
+        }
+        // Butun matndan topish
+        Matcher am = AUTHORITY_PAT.matcher(t);
+        if (am.find())
+            return am.group(1).trim();
+        return null;
+    }
+
+    // ---------------------------------------------------------------
+    // Berilgan sana (DATE OF ISSUE / BERILGAN SANASI)
+    // ---------------------------------------------------------------
+    private String extractIssuedDate(String t) {
+        String[] labels = {
+                "BERILGAN SANASI / DATE OF", // "ISSUE" keyingi satrda bo'lishi mumkin
+                "BERILGAN SANASI / DATE OF ISSUE",
+                "BERILGAN SANASI/DATE OF ISSUE",
+                "DATE OF ISSUE",
+                "BERILGAN SANASI",
+                "BERILGAN SANA"
+        };
+        for (String lbl : labels) {
+            int idx = t.indexOf(lbl);
+            if (idx == -1)
+                continue;
+            String slice = t.substring(idx + lbl.length(), Math.min(t.length(), idx + lbl.length() + 80));
+            Matcher dm = DATE_CLEAN.matcher(slice);
+            if (dm.find()) {
+                // "DATE OF EXPIRY" dan oldin kelishini tekshiramiz
+                try {
+                    int year = Integer.parseInt(dm.group(3));
+                    if (year <= LocalDate.now().getYear() && year >= 2000)
+                        return formatDate(dm);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    // ---------------------------------------------------------------
+    // Amal qilish muddati (DATE OF EXPIRY)
+    // ---------------------------------------------------------------
+    private String extractExpiryDate(String t) {
+        String[] labels = { "AMAL QILISH MUDDATI / DATE OF EXPIRY",
+                "DATE OF EXPIRY", "AMAL QILISH MUDDATI" };
+        for (String lbl : labels) {
+            int idx = t.indexOf(lbl);
+            if (idx == -1)
+                continue;
+            String slice = t.substring(idx + lbl.length(), Math.min(t.length(), idx + lbl.length() + 40));
+            Matcher dm = DATE_CLEAN.matcher(slice);
+            if (dm.find())
+                return formatDate(dm);
+        }
+        // MRZ fallback
+        Matcher mrzM = MRZ_LINE2.matcher(t);
+        if (mrzM.find()) {
+            String yy = mrzM.group(6);
+            String mm = mrzM.group(7);
+            String dd = mrzM.group(8);
+            return dd + "." + mm + "." + yyToYear(yy);
+        }
+        return null;
+    }
+
+    // ---------------------------------------------------------------
+    // Yordamchi metodlar
+    // ---------------------------------------------------------------
+    private String formatDate(Matcher dm) {
+        return dm.group(1) + "." + dm.group(2) + "." + dm.group(3);
+    }
+
+    private String yyToYear(String yy) {
         int y = Integer.parseInt(yy);
         return (y > 30 ? "19" : "20") + yy;
     }
-
-    private String extractGender(String text) {
-        // Har doim katta harfli bo'lishini ta'minlaymiz
-        String upper = text.toUpperCase();
-
-        // Trigger joylashuvini topamiz
-        int jinsIndex = upper.indexOf("JINSI");
-        int sexIndex = upper.indexOf("SEX");
-
-        // Eng yaqin pozitsiyani olish
-        int index = jinsIndex != -1 ? jinsIndex : sexIndex;
-
-        if (index != -1) {
-            // 1. 0 dan 60 belgigacha bo‘lgan oraliqni tekshiramiz
-            String slice = upper.substring(index, Math.min(index + 60, upper.length()));
-
-            // 2. Oraliqdan " M " yoki " F " ni ajratamiz
-            Pattern pattern = Pattern.compile("\\b([MF])\\b");
-            Matcher matcher = pattern.matcher(slice);
-            if (matcher.find()) {
-                String code = matcher.group(1);
-                return code.equals("M") ? "Erkak" : code.equals("F") ? "Ayol" : null;
-            }
-
-            // 3. Yoki oxirgi so‘z sifatida kelganini ushlaymiz
-            String[] words = slice.split("\\s+");
-            for (String word : words) {
-                if (word.equals("M")) return "Erkak";
-                if (word.equals("F")) return "Ayol";
-            }
-        }
-
-        return null;
-    }
-
-
-    private String extractPassportNumber(String text) {
-        // 1. Normalize qilingan matn (keraksiz belgilarni olib tashlaymiz)
-        String normalized = text.toUpperCase()
-                .replaceAll("['‘’`]", "")
-                .replaceAll("[^A-Z0-9\\s]", "")
-                .replaceAll("\\s+", " ");
-
-        // 2. PASSPORT so‘zlari atrofidan qidiramiz (label asosida)
-        Pattern labelPattern = Pattern.compile("(PASPORT|PASSPORT)[^A-Z0-9]{0,20}([A-Z]{2}\\s?[0-9]{7,9})");
-        Matcher labelMatcher = labelPattern.matcher(normalized);
-        if (labelMatcher.find()) {
-            return labelMatcher.group(2).replace(" ", "");
-        }
-
-        // 3. MRZ qismidan qidiramiz: "P<UZB...AA1234567..."
-        Pattern mrzPattern = Pattern.compile("P<UZB.*?([A-Z]{2}[0-9]{7,9})");
-        Matcher mrzMatcher = mrzPattern.matcher(normalized);
-        if (mrzMatcher.find()) {
-            return mrzMatcher.group(1);
-        }
-
-        // 4. Fallback — oddiy regex orqali birinchi variantni olish
-        Pattern fallback = Pattern.compile("\\b[A-Z]{2}\\s?[0-9]{7,9}\\b");
-        Matcher fallbackMatcher = fallback.matcher(normalized);
-        if (fallbackMatcher.find()) {
-            return fallbackMatcher.group().replace(" ", "");
-        }
-
-        return null;
-    }
-    private String extractBerilganSana(String text) {
-        if (text == null || text.isBlank()) return null;
-
-        String normalized = text.toUpperCase()
-                .replaceAll("[^A-Z0-9./\\s-]", " ")           // no kerakli belgilardan tozalash
-                .replaceAll("(\\d)\\s*\\.\\s*(\\d)", "$1.$2") // 10 .2021 → 10.2021
-                .replaceAll("\\s+", " ");                     // ko'p probellarni bitta qilish
-
-        // Faqat "BERILGAN SANASI" yoki "DATE OF ISSUE" dan so'ng 10 ta so'zgacha ichida sana bo‘lishi mumkin
-        Pattern pattern = Pattern.compile(
-                "(BERILGAN SANASI|DATE OF ISSUE|AUTHORITY ISSUE)" +
-                        "(?:\\s+[A-Z]+)*" +               // optional MIA
-                        "(?:\\s+\\d{3,6})*" +             // optional 33223
-                        "\\s+(\\d{1,2})[\\s./\\\\-]+(\\d{1,2})[\\s./\\\\-]+(\\d{2,4})"
-        );
-
-        Matcher matcher = pattern.matcher(normalized);
-        if (matcher.find()) {
-            try {
-                int day = Integer.parseInt(matcher.group(1));
-                int month = Integer.parseInt(matcher.group(2));
-                String year = matcher.group(3);
-                if (year.length() == 2) year = "20" + year;
-                return String.format("%02d.%02d.%s", day, month, year);
-            } catch (NumberFormatException e) {
-                System.err.println("⚠️ Date parsing error: " + e.getMessage());
-            }
-        }
-
-        return null;
-    }
-
-    private String extractDateAfterKeyword(String text, String keyword) {
-        int index = text.indexOf(keyword);
-        if (index != -1) {
-            String after = text.substring(index, Math.min(index + 100, text.length()));
-            Matcher matcher = Pattern.compile("\\d{2}[.\\-/]\\d{2}[.\\-/]\\d{4}").matcher(after);
-            if (matcher.find()) return matcher.group();
-        }
-        return null;
-    }
-
-    private String extractPlaceOfBirth(String text) {
-        // Trigger so‘zlar
-        String[] triggers = {
-                "PLACE OF BIRTH", "TUG'ILGAN JOYI"
-        };
-
-        for (String trigger : triggers) {
-            int index = text.indexOf(trigger);
-            if (index != -1) {
-                // 1. Keyingi 20-40 belgidan substring olamiz
-                String slice = text.substring(index, Math.min(index + 50, text.length()));
-
-                // 2. "M XONQA" ko‘rinishidagi ketma-ketlikni ushlaymiz
-                Pattern genderPlacePattern = Pattern.compile("SEX\\s+([MF])\\s+([A-Z'`´]{3,20})");
-                Matcher matcher = genderPlacePattern.matcher(slice);
-                if (matcher.find()) {
-                    return matcher.group(2); // faqat joy
-                }
-
-                // 3. Agar yuqoridagisi topilmasa, oddiy keyingi so‘zni olishga harakat qilamiz
-                Pattern fallback = Pattern.compile(trigger + "[\\s\\-:/\\\\]*[MF]?\\s*([A-Z'`´]{3,20})");
-                Matcher fallbackMatcher = fallback.matcher(slice);
-                if (fallbackMatcher.find()) {
-                    return fallbackMatcher.group(1);
-                }
-            }
-        }
-
-        return null;
-    }
 }
-// berilgan sanada muammo

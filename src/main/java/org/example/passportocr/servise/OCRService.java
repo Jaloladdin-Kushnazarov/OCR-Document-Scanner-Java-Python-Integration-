@@ -4,7 +4,7 @@ import lombok.RequiredArgsConstructor;
 import org.example.passportocr.dto.BaseDocumentDto;
 import org.example.passportocr.dto.UnknownDocumentDto;
 import org.example.passportocr.enums.DocumentType;
-import org.example.passportocr.util.MultipartInputStreamFileResource;
+import org.example.passportocr.util.MultipartByteArrayResource;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -22,27 +22,24 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class OCRService {
 
-
     private final IDCardParserService idCardParserService;
     private final PassportParserService passportParserService;
     private final DrivingLicenseParserService driverLicenseParserService;
     private final RestTemplate restTemplate;
-
 
     public String extractTextFromImage(MultipartFile file) throws IOException {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.MULTIPART_FORM_DATA);
 
         MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-        body.add("file", new MultipartInputStreamFileResource(file.getInputStream(), file.getOriginalFilename()));
+        body.add("file", new MultipartByteArrayResource(file.getBytes(), file.getOriginalFilename()));
 
         HttpEntity<MultiValueMap<String, Object>> request = new HttpEntity<>(body, headers);
 
         ResponseEntity<Map> response = restTemplate.postForEntity(
-                "http://localhost:8000/ocr/",  // Python tarafdagi API
+                "http://localhost:8000/ocr/", // Python tarafdagi API
                 request,
-                Map.class
-        );
+                Map.class);
         System.out.println(response.getBody().get("text").toString());
         return response.getBody().get("text").toString();
     }
@@ -50,9 +47,12 @@ public class OCRService {
     public DocumentType identifyDocumentType(String text) {
         String upper = text.toUpperCase();
 
-        if (upper.contains("SHAXS GUVOHNOMASI") || upper.contains("IDENTITY CARD")) return DocumentType.ID_CARD;
-        if (upper.contains("PASSPORT") || upper.contains("PASSPORT NO")) return DocumentType.PASSPORT;
-        if (upper.contains("HAYDOVCHILIK GUVOHNOMASI") || upper.contains("DRIVING LICENCE"))return DocumentType.DRIVER_LICENSE;
+        if (upper.contains("SHAXS GUVOHNOMASI") || upper.contains("IDENTITY CARD"))
+            return DocumentType.ID_CARD;
+        if (upper.contains("PASSPORT") || upper.contains("PASSPORT NO"))
+            return DocumentType.PASSPORT;
+        if (upper.contains("HAYDOVCHILIK GUVOHNOMASI") || upper.contains("DRIVING LICENCE"))
+            return DocumentType.DRIVER_LICENSE;
 
         return DocumentType.UNKNOWN;
     }
@@ -73,4 +73,3 @@ public class OCRService {
         };
     }
 }
-

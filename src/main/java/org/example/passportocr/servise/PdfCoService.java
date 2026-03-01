@@ -17,7 +17,7 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class PdfCoService {
 
-    @Value("${pdfco.api.key}")
+//    @Value("${pdfco.api.key}")
     private String apiKey;
 
     private final WebClient webClient = WebClient.builder()
